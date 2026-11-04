@@ -1,0 +1,129 @@
+Считаю линейку на твоей трассе и сохраняю скрипты, сейчас отдам итог.
+
+Распознавание рядом с узлом работает. Низкий процент повторных узнаваний идёт не от провала распознавания, а от того, что у агента мало узлов и он редко возвращается. Скрипты (pn_ladder.py, pn_false_recog.py) запускаются в папке с .npz.
+
+Линейка: P(тот же узел | истинное расстояние):
+
+расстояние, клеток	P
+
+0–1	0.96
+2–3	0.83
+3–5	0.71
+5–8	0.52
+8–12	0.32
+20–40	0.08
+40+	0.02
+
+
+Узел «держит» примерно радиус 5–8 клеток.
+
+Узнавание и создание:
+
+- Повторное узнавание (35220 строк): медиана 2.2 клетки от места рождения узла, p90 9. Ложных (дальше 15 клеток) 3.6%, это 1282 строки.
+- Создание узлов: первых узлов 875. Из остальных 1800 только 3% лежат в 2 клетках от существующего, медиана 6.9. Дублей почти нет.
+- Пропущенное узнавание (pending/uncertain, узла нет): медиана 7.4 клетки до ближайшего узла, в пределах 4 клеток лишь 19%. Агент чаще действительно в незнакомом месте. Узлов около 3 на агента (2675 на 883), приходов в известный узел 323.
+
+Ложные узнавания растут с возрастом узла: 0% для узлов младше 20 тиков, 3.1% для 20–60, 8.6% для 60–150, 9.1% для 150–400. У них уверенность ниже (0.67 против 0.81), а медиана err равна 0, то есть собственный spatial_err агента их не видит (p90 0.78). Причину не проверял. Возможны дрейф интегрирования пути или алиасинг отпечатка. Расстояния считаю по истинным cx, cy, которые трассер пишет только для диагностики.
+
+Что это значит для PN-ветки:
+
+- Больше узлов или более мелкая сетка проблему не решат: сначала упираемся в возвраты и рёбра.
+- Ложные узнавания надо ловить через возраст узла и уверенность, а не через текущий err.
+
+Выводы по одному прогону, предсказательную ценность места по каналам (этап 1.5) я не считал.
+import numpy as np, json
+import sys, glob, os
+cand = glob.glob('/content/drive/MyDrive/832_ledgers/pntrace.npz') + glob.glob('./pntrace_.npz')
+arg = [a for a in sys.argv[1:] if a.endswith('.npz')]
+NPZ = arg[0] if arg else (max(cand, key=os.path.getmtime) if cand else None)
+assert NPZ, "не нашёл pntrace*.npz: положи файл рядом или передай путь аргументом"
+print("трасса:", NPZ)
+W=208
+f=NPZ; Z=np.load(f); D={k:Z[k] for k in Z.files}
+m=D['run']==0
+g=lambda k:D[k][m]
+agent,t,cx,cy,state,node,created,arr=[g(k) for k in ('agent','t','cx','cy','state','node','created','arrival')]
+ST=['unknown','pending','tentative','ambiguous','uncertain','recognized','new']
+def tor(dx): dx=np.abs(dx)%W; return np.minimum(dx,W-dx)
+dist=lambda x1,y1,x2,y2: np.hypot(tor(x1-x2),tor(y1-y2))
+print("строк",m.sum(),"агентов",len(np.unique(agent)),"| created",int(created.sum()),"arrival",int(arr.sum()))
+order=np.lexsort((t,agent));
+A=agent[order]; T=t[order]; X=cx[order]; Y=cy[order]; S=state[order]; N=node[order]; C=created[order]; AR=arr[order]
+ids=np.unique(A)
+rec_d=[]; cre_d=[]; cre_first=0; miss=[]; pairs_same={}; pairs_all={}
+bins=np.array([0,1,2,3,5,8,12,20,40,1e9]); nb=len(bins)-1
+for a in ids:
+ii=np.where(A==a)[0]
+x,y,s,n,c,tt=X[ii],Y[ii],S[ii],N[ii],C[ii],T[ii]
+anch={}  # node -> (x,y)
+for k in range(len(ii)):
+if c[k]==1 and n[k]>=0:
+if anch:
+ax=np.array([v[0] for v in anch.values()]); ay=np.array([v[1] for v in anch.values()])
+cre_d.append(dist(x[k],y[k],ax,ay).min())
+else: cre_first+=1
+anch[int(n[k])]=(x[k],y[k])
+elif s[k]==5 and n[k]>=0 and int(n[k]) in anch:
+rec_d.append(dist(x[k],y[k],*anch[int(n[k])]))
+elif n[k]<0 and anch and s[k] in (1,4):
+ax=np.array([v[0] for v in anch.values()]); ay=np.array([v[1] for v in anch.values()])
+miss.append(dist(x[k],y[k],ax,ay).min())
+# лесенка пар: строки с узлом
+j=np.where(n>=0)[0]
+if len(j)>1:
+iu=np.triu_indices(len(j),1)
+d=dist(x[j][iu[0]],y[j][iu[0]],x[j][iu[1]],y[j][iu[1]]); same=(n[j][iu[0]]==n[j][iu[1]])
+b=np.digitize(d,bins)-1
+for q in range(nb):
+mq=b==q
+pairs_all[q]=pairs_all.get(q,0)+int(mq.sum()); pairs_same[q]=pairs_same.get(q,0)+int((same&mq).sum())
+rec_d=np.array(rec_d); cre_d=np.array(cre_d); miss=np.array(miss)
+P=lambda a,q:np.percentile(a,q)
+print(f"\n[1] ПОВТОРНОЕ УЗНАВАНИЕ (state=recognized, узел известен): расстояние до места рождения узла (истинное), n={len(rec_d)}")
+print(f"    p50={P(rec_d,50):.1f} p90={P(rec_d,90):.1f} p99={P(rec_d,99):.1f} | доля ≤2: {np.mean(rec_d<=2):.2f} ≤4: {np.mean(rec_d<=4):.2f} ≤8: {np.mean(rec_d<=8):.2f} ≤15: {np.mean(rec_d<=15):.2f} >15 (ложное узнавание): {np.mean(rec_d>15):.3f}")
+print(f"\n[2] СОЗДАНИЕ УЗЛА: расстояние до ближайшего уже существующего узла того же агента, n={len(cre_d)} (первых узлов без соседей: {cre_first})")
+print(f"    p10={P(cre_d,10):.1f} p50={P(cre_d,50):.1f} p90={P(cre_d,90):.1f} | доля ≤2: {np.mean(cre_d<=2):.2f} ≤4: {np.mean(cre_d<=4):.2f} ≤8: {np.mean(cre_d<=8):.2f} ≤15: {np.mean(cre_d<=15):.2f} (дубли/ложная новизна: близко к существующему)")
+print(f"\n[3] ПРОПУЩЕННОЕ УЗНАВАНИЕ (pending/uncertain, узла нет), расстояние до ближайшего узла агента, n={len(miss)}")
+print(f"    p50={P(miss,50):.1f} | доля ≤2: {np.mean(miss<=2):.2f} ≤4: {np.mean(miss<=4):.2f} ≤8: {np.mean(miss<=8):.2f}")
+print("\n[4] ЛИНЕЙКА: P(тот же узел | истинное расстояние между двумя замерами одного агента), пары с узлом")
+lab=['0–1','1–2','2–3','3–5','5–8','8–12','12–20','20–40','40+']
+for q in range(nb):
+n=pairs_all.get(q,0); print(f"    r={lab[q]:>6s}: пар {n:8d}  P(same)={pairs_same.get(q,0)/n if n else float('nan'):.3f}")
+import numpy as np
+import sys, glob, os
+cand = glob.glob('/content/drive/MyDrive/832_ledgers/pntrace.npz') + glob.glob('./pntrace_.npz')
+_arg = [a for a in sys.argv[1:] if a.endswith('.npz')]
+NPZ = _arg[0] if _arg else (max(_cand, key=os.path.getmtime) if cand else None)
+assert NPZ, "не нашёл pntrace*.npz: положи файл рядом или передай путь аргументом"
+print("трасса:", NPZ)
+W=208
+Z=np.load(NPZ); D={k:Z[k] for k in Z.files}
+m=D['run']==0
+g=lambda k:D[k][m]
+agent,t,cx,cy,state,node,created=[g(k) for k in ('agent','t','cx','cy','state','node','created')]
+err,pi_err,conf,path,pis,spost=[g(k) for k in ('err','pi_err','conf','path','pi_err','spatial_err_post')]
+t1e,t1c=g('top1_err'),g('top1_conf')
+def tor(dx): dx=np.abs(dx)%W; return np.minimum(dx,W-dx)
+order=np.lexsort((t,agent)); idx=order
+rows=[]
+anch={}
+for k in idx:
+a=int(agent[k]); n=int(node[k])
+if created[k]==1 and n>=0: anch[(a,n)]=(cx[k],cy[k],t[k]); continue
+if state[k]==5 and n>=0 and (a,n) in anch:
+ax,ay,t0=anch[(a,n)]
+rows.append((np.hypot(tor(cx[k]-ax),tor(cy[k]-ay)),err[k],pi_err[k],conf[k],path[k],t[k]-t0,t1e[k],t1c[k],spost[k]))
+R=np.array(rows)
+d=R[:,0]
+grp={'верно ≤4':d<=4,'4–15':(d>4)&(d<=15),'ЛОЖНОЕ >15':d>15}
+names=['err','pi_err','conf','path','тиков с рождения узла','top1_err','top1_conf','spatial_err_post']
+print("медиана (p90) по группам recognized-строк; n:",{k:int(v.sum()) for k,v in grp.items()})
+for j,nm in enumerate(names,1):
+print(f"{nm:24s}"+"  ".join(f"{k}: {np.median(R[v,j]):.3f} ({np.percentile(R[v,j],90):.3f})" for k,v in grp.items()))
+
+ложные узнавания: доля у агентов/узлов
+
+fa=d>15
+print("\nдоля ЛОЖНЫХ по возрасту узла (тиков с рождения): ",{f"{lo}-{hi}":round(float(fa[(R[:,5]>=lo)&(R[:,5]<hi)].mean()),3) for lo,hi in ((0,20),(20,60),(60,150),(150,400),(400,700))})
+
+Вот что мне дали
